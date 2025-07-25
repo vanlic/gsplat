@@ -35,7 +35,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, BrushStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -76,6 +76,8 @@ class Config:
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
+    # Number of Max splats
+    max_splats: int = 10_000_000
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
@@ -112,7 +114,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, BrushStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -204,6 +206,13 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, BrushStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.growth_stop_iter = int(strategy.growth_stop_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.max_steps = int(strategy.max_steps * factor)
+            strategy.max_splats = int(strategy.max_splats * factor)
         else:
             assert_never(strategy)
 
@@ -253,6 +262,19 @@ def create_splats_with_optimizers(
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
+    if isinstance(cfg.strategy, BrushStrategy):
+        def inverse_sigmoid(x):
+            return math.log(x / (1 - x))
+        
+        dist2_avg = (knn(points, 4)[:, 1:-1] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg) * 0.5
+        opacities.data.uniform_(inverse_sigmoid(0.1), inverse_sigmoid(0.25))
+
+        means_lr = 4e-5
+        scales_lr = 1e-2
+        opacities_lr = 3e-2
+
 
     params = [
         # name, value, lr
@@ -382,6 +404,10 @@ class Runner:
                 scene_scale=self.scene_scale
             )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state()
+        elif isinstance(self.cfg.strategy, BrushStrategy):
+            self.cfg.strategy.max_splats = self.cfg.max_splats
+            self.cfg.strategy.max_steps = self.cfg.max_steps
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
@@ -527,7 +553,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, BrushStrategy)
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -562,6 +588,13 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
+        if isinstance(self.cfg.strategy, BrushStrategy):
+            schedulers.append(
+                # scales has a learning rate schedule, that end at 0.01 of the initial value
+                torch.optim.lr_scheduler.ExponentialLR(
+                        self.optimizers["scales"], gamma=0.6 ** (1.0 / max_steps)
+                ) 
+            )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -709,6 +742,9 @@ class Runner:
                 loss += tvloss
 
             # regularizations
+            if isinstance(cfg.strategy, BrushStrategy):
+                loss += 1e-8 * (1.0 - step / max_steps) * \
+                        (torch.sigmoid(self.splats["opacities"]) * (info["radii"] > 0.0).all(dim=-1).float()).sum()
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
@@ -876,6 +912,16 @@ class Runner:
                     step=step,
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
+                )
+            elif isinstance(self.cfg.strategy, BrushStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    lr=schedulers[0].get_last_lr()[0],
+                    info=info,
+                    packed=cfg.packed,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1220,6 +1266,12 @@ if __name__ == "__main__":
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
+        "brush":(
+            "Brush densitify strategy",
+            Config(
+                strategy=BrushStrategy(verbose=True),
+            )
+        )
     }
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
