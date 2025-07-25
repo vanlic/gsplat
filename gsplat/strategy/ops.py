@@ -367,3 +367,43 @@ def inject_noise_to_position(
     )
     noise = torch.einsum("bij,bj->bi", covars, noise)
     params["means"].add_(noise)
+
+
+@torch.no_grad()
+def inject_noise_to_position_brush(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, torch.Tensor],
+    scaler: float,
+):
+    """
+    Inject random noise into 'means' weighted by (1 - alpha)^100,
+    then transform by the local covariance to preserve orientation/scale.
+
+    :param params: Dict of parameter tensors (requires ["means", "opacities", "scales", "quats"]).
+    :param optimizers: Dict of optimizers (not actually modified here).
+    :param state: Custom dictionary state (not used here).
+    :param scaler: Base scaling factor for noise.
+    """
+    # 1) Compute alpha and convert to weighting = (1 - alpha)^100
+    opacities = torch.sigmoid(params["opacities"].flatten())
+    alpha_weight = (1.0 - opacities).pow(100)
+
+    visible = state["curr_splats"]
+
+    alpha_weight *= visible
+
+    # print('/////', torch.max(alpha_weight*scaler))
+    noise_weight = alpha_weight * scaler
+
+    # 2) Compute local covariance for each Gaussian (orientation & scale)
+    scales = torch.exp(params["scales"])
+
+    norm_quat = F.normalize(params["quats"], dim=-1)
+    rot_mats = normalized_quat_to_rotmat(norm_quat)
+    samples = torch.einsum("bij,bj->bi", rot_mats, torch.randn_like(params["means"]) * scales)
+
+    noise = samples * noise_weight.unsqueeze(-1)
+
+    # 5) In-place add to the means
+    params["means"].add_(noise)
