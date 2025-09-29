@@ -189,6 +189,9 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Enable brush v2
+    use_brush_v2: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -371,6 +374,11 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
+        if cfg.use_brush_v2:
+            cfg.means_lr = 2e-5
+            cfg.scale_lr = 7e-3
+            cfg.quats_lr = 2e-3
+            cfg.opacities_lr = 0.012
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -922,6 +930,7 @@ class Runner:
                     lr=schedulers[0].get_last_lr()[0],
                     info=info,
                     packed=cfg.packed,
+                    v2=self.cfg.use_brush_v2
                 )
             else:
                 assert_never(self.cfg.strategy)

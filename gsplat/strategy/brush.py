@@ -107,12 +107,16 @@ class BrushStrategy(Strategy):
         lr: float,
         info: Dict[str, Any],
         packed: bool = False,
-        v2: bool  = False
+        v2: bool = False
     ):   
         if v2:
+            # 更新默认参数
+            self.refine_every = 200
+            # self.grow_grad2d = 0.003
+            self.refine_grow_fraction = 0.2
             # 更新noise权重、计算新box
             self.mean_noise_weight = 50
-            if not getattr(self, "bound"):
+            if not hasattr(self, "bound"):
                 self.bound = BoundingBox(params["means"], 0.8)
                 print("Center:", self.bound.center)
                 print("Extent:", self.bound.extent)
@@ -178,19 +182,22 @@ class BrushStrategy(Strategy):
                 )
             
             # 衰减opac和scales
-            if v2:
-                with torch.no_grad():
-                    train_t = step / self.max_steps
-                    t_shrink_strength = 1.0 - train_t
+            # TODO: 当前衰减会导致无限接近透明，需要修改
+            # if v2:
+            #     print("===触发衰减===")
+            #     with torch.no_grad():
+            #         train_t = step / self.max_steps
+            #         t_shrink_strength = 1.0 - train_t
 
-                    minus_opac = self.opac_decay * t_shrink_strength
-                    scale_scaling = 1.0 - self.scales_decay * t_shrink_strength
+            #         minus_opac = self.opac_decay * t_shrink_strength
+            #         scale_scaling = 1.0 - self.scales_decay * t_shrink_strength
 
-                    new_opac = torch.sigmoid(params["opacities"]) - minus_opac  
-                    params["opacities"] = (new_opac / (1.0 - new_opac + 1e-24)).log()
+            #         new_opac = torch.sigmoid(params["opacities"]) - minus_opac 
+            #         new_opac = new_opac.clamp(1e-12, 1.0 - 1e-12) 
+            #         params["opacities"] = (new_opac / (1.0 - new_opac + 1e-24)).log()
 
-                    new_scales = (params["scales"].exp() * scale_scaling).log()
-                    params["scales"] = new_scales
+            #         new_scales = (params["scales"].exp() * scale_scaling).log()
+            #         params["scales"] = new_scales
 
             # reset stats
             state["grad2d"].zero_()
@@ -219,6 +226,7 @@ class BrushStrategy(Strategy):
             assert key in info, f"{key} is required but missing."
 
         # normalize grads to [-1, 1] screen space
+        # TODO： 当前梯度与Brush最新版本的普通梯度长度存在差异，需要修改
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad.clone()
         else:
@@ -421,14 +429,17 @@ class BrushStrategy(Strategy):
                     v_new = torch.zeros(extra_shape, dtype=v.dtype, device=v.device)
                     state[k] = torch.cat([v, v_new], dim=0)
 
-       
+     
 class BoundingBox:
     def __init__(self, means, percentile=0.8):
         self.center = None
         self.extent = None
-        self.__get_bounds(means, percentile)
-    
-    def __get_bounds(self, means, percentile):
+        self.means = means
+        self.percentile = percentile
+        self.__get_bounds()
+
+    @torch.no_grad() 
+    def __get_bounds(self):
          # Filter out NaN and infinite values
         valid_means = self.means[torch.isfinite(self.means).all(dim=1)]
 
