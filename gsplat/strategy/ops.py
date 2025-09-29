@@ -407,3 +407,51 @@ def inject_noise_to_position_brush(
 
     # 5) In-place add to the means
     params["means"].add_(noise)
+
+
+@torch.no_grad()
+def inject_noise_to_position_brush_v2(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, torch.Tensor],
+    scaler: float,
+    max_noise: float,
+):
+    """
+    Inject random noise into 'means' weighted by (1 - alpha)^100,
+    then transform by the local covariance to preserve orientation/scale.
+
+    :param params: Dict of parameter tensors (requires ["means", "opacities", "scales", "quats"]).
+    :param optimizers: Dict of optimizers (not actually modified here).
+    :param state: Custom dictionary state (not used here).
+    :param scaler: Base scaling factor for noise.
+    """
+    # 1) Compute alpha and convert to weighting = (1 - alpha)^100
+    opacities = torch.sigmoid(params["opacities"].flatten())
+    alpha_weight = (1.0 - opacities).pow(150)
+
+    visible = state["curr_splats"]
+
+    alpha_weight *= visible
+
+    # print('/////', torch.max(alpha_weight*scaler))
+    noise_weight = alpha_weight * scaler
+
+    samples = torch.randn_like(params["means"])
+
+    noise = (samples * noise_weight.unsqueeze(-1)).clamp(-max_noise, max_noise)
+
+    # 5) In-place add to the means
+    params["means"].add_(noise)
+
+@torch.no_grad()
+def scale_down_largest_dim(scales: Tensor, factor: float):
+    max_values, _ = scales.max(dim=1, keepdim=True)
+    max_mask = scales == max_values
+
+    # Create a scale tensor with ones, and fill the maximum values with the factor
+    scale = torch.ones_like(scales)
+    scale[max_mask] = factor
+
+    # Multiply the scales by the scale tensor
+    return scales * scale

@@ -7,8 +7,8 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from .base import Strategy
-from .ops import inject_noise_to_position_brush, _multinomial_sample, remove
-from .ops import normalized_quat_to_rotmat, _update_param_with_optimizer
+from .ops import inject_noise_to_position_brush, inject_noise_to_position_brush_v2, _multinomial_sample, remove
+from .ops import normalized_quat_to_rotmat, _update_param_with_optimizer, scale_down_largest_dim
 
 @dataclass
 class BrushStrategy(Strategy):
@@ -107,16 +107,41 @@ class BrushStrategy(Strategy):
         lr: float,
         info: Dict[str, Any],
         packed: bool = False,
+        v2: bool  = False
     ):   
+        if v2:
+            # 更新noise权重、计算新box
+            self.mean_noise_weight = 50
+            if not getattr(self, "bound"):
+                self.bound = BoundingBox(params["means"], 0.8)
+                print("Center:", self.bound.center)
+                print("Extent:", self.bound.extent)
+                print("Min:", self.bound.min())
+                print("Max:", self.bound.max())
+                print("Median Size:", self.bound.median_size())
+            # 更新opac衰减和scales衰减
+            self.opac_decay = 0.004
+            self.scales_decay = 0.002
+        
         self._update_state(params, state, info, packed=packed)
         
         if step < self.refine_stop_iter:
-            inject_noise_to_position_brush(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                scaler=(1.0 - step / self.max_steps) * self.mean_noise_weight * lr,
-            )
+            if not v2:
+                inject_noise_to_position_brush(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    scaler=(1.0 - step / self.max_steps) * self.mean_noise_weight * lr,
+                )
+            else:
+                inject_noise_to_position_brush_v2(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    scaler= self.mean_noise_weight * lr * self.bound.median_size(),
+                    max_noise=self.bound.median_size()
+                )
+
         
         if (step > self.refine_start_iter) and (step % self.refine_every == 0):
             n_prune = self._prune_gs(params, optimizers, state)
@@ -151,6 +176,21 @@ class BrushStrategy(Strategy):
                     f"[Refine@step={step}] pruned={n_prune} added={add_ids.numel()} "
                     f"-> effective add={add_ids.numel() - n_prune} #splats={len(params['means'])} "
                 )
+            
+            # 衰减opac和scales
+            if v2:
+                with torch.no_grad():
+                    train_t = step / self.max_steps
+                    t_shrink_strength = 1.0 - train_t
+
+                    minus_opac = self.opac_decay * t_shrink_strength
+                    scale_scaling = 1.0 - self.scales_decay * t_shrink_strength
+
+                    new_opac = torch.sigmoid(params["opacities"]) - minus_opac  
+                    params["opacities"] = (new_opac / (1.0 - new_opac + 1e-24)).log()
+
+                    new_scales = (params["scales"].exp() * scale_scaling).log()
+                    params["scales"] = new_scales
 
             # reset stats
             state["grad2d"].zero_()
@@ -231,10 +271,23 @@ class BrushStrategy(Strategy):
             self, 
             params: Dict[str, torch.nn.Parameter], 
             optimizers: Dict[str, torch.optim.Optimizer], 
-            state: Dict[str, Any]
+            state: Dict[str, Any],
+            v2: bool = False
     ) -> int:
         alpha = torch.sigmoid(params["opacities"])
         is_prune = alpha < self.prune_opa
+
+        if v2:
+            max_allowed_bounds = max(self.bound.extent) * 100.
+            # 删除过远的,过大的，过小的
+            is_far = torch.any((params["means"] - self.bound.center) > max_allowed_bounds, dim=1)
+            is_big = torch.any(params["scales"] > max_allowed_bounds, dim=1)
+            is_small = torch.any(params["scales"] < 1e-10, dim=1)
+
+            is_prune = torch.logical_or(is_prune, is_far)
+            is_prune = torch.logical_or(is_prune, is_big)
+            is_prune = torch.logical_or(is_prune, is_small)
+
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
@@ -267,7 +320,7 @@ class BrushStrategy(Strategy):
         state: Dict[str, torch.Tensor],
         n_prune: int = 0,
     ):
-        old_count = params["means"].numel()
+        old_count = len(params["means"])
         grads = state["grad2d"]
 
         is_grad_high = grads > self.grow_grad2d
@@ -292,6 +345,7 @@ class BrushStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         chosen_inds: Tensor,
+        v2: bool = False
     ):
         if chosen_inds.numel() == 0:
             return
@@ -304,7 +358,7 @@ class BrushStrategy(Strategy):
 
         # Basic shrink/offset parameters
         scale_offset = math.log(math.sqrt(2.0))  # ~0.3466
-        noise_std = 0.5
+        noise_std = 0.5 if not v2 else 1.0
 
         # 2) param_fn: Modify p[sampled_inds] in-place, then cat p[sampled_inds] to the end
         # TODO: Try ResGS? 
@@ -323,10 +377,15 @@ class BrushStrategy(Strategy):
             
             elif name == "scales":
                 old_log_scales = p[chosen_inds]
-
-                appended = old_log_scales - scale_offset
-                p[chosen_inds] = appended
-                p_new = torch.cat([p, appended], dim=0)
+                if v2:
+                    old_exp_scales = old_log_scales.exp()
+                    new_exp_scales = scale_down_largest_dim(old_exp_scales, 0.5)
+                    p[chosen_inds] = new_exp_scales.log()
+                    p_new = torch.cat([p, new_exp_scales.log()], dim=0) 
+                else:
+                    appended = old_log_scales - scale_offset
+                    p[chosen_inds] = appended
+                    p_new = torch.cat([p, appended], dim=0)
             
             elif name == "opacities":
                 old_raw_opa = p[chosen_inds]
@@ -363,5 +422,50 @@ class BrushStrategy(Strategy):
                     state[k] = torch.cat([v, v_new], dim=0)
 
        
+class BoundingBox:
+    def __init__(self, means, percentile=0.8):
+        self.center = None
+        self.extent = None
+        self.__get_bounds(means, percentile)
+    
+    def __get_bounds(self, means, percentile):
+         # Filter out NaN and infinite values
+        valid_means = self.means[torch.isfinite(self.means).all(dim=1)]
+
+        # Split into x, y, z values
+        x_vals = valid_means[:, 0]
+        y_vals = valid_means[:, 1]
+        z_vals = valid_means[:, 2]
+
+        # Get upper and lower percentiles
+        lower_idx = int((1.0 - self.percentile) / 2.0 * len(x_vals))
+        upper_idx = min(len(x_vals) - 1, int((1.0 + self.percentile) / 2.0 * len(x_vals)))
+
+        # Calculate the percentiles
+        x_lower, x_upper = torch.kthvalue(x_vals, lower_idx + 1).values, torch.kthvalue(x_vals, upper_idx + 1).values
+        y_lower, y_upper = torch.kthvalue(y_vals, lower_idx + 1).values, torch.kthvalue(y_vals, upper_idx + 1).values
+        z_lower, z_upper = torch.kthvalue(z_vals, lower_idx + 1).values, torch.kthvalue(z_vals, upper_idx + 1).values
+
+        # Calculate the center and extent
+        self.center = torch.tensor([
+            (x_lower + x_upper) / 2.0,
+            (y_lower + y_upper) / 2.0,
+            (z_lower + z_upper) / 2.0
+        ]).numpy()
+        self.extent = torch.tensor([
+            (x_upper - x_lower) / 2.0,
+            (y_upper - y_lower) / 2.0,
+            (z_upper - z_lower) / 2.0
+        ]).numpy()
+    
+    def min(self):
+        return self.center - self.extent
+
+    def max(self):
+        return self.center + self.extent
+    
+    def median_size(self):
+        extents_sorted  = sorted(self.extent)
+        return extents_sorted[1] * 2.0
 
 
