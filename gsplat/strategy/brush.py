@@ -25,7 +25,7 @@ class BrushStrategy(Strategy):
     mean_noise_weight: float = 1e4
 
     # density and remove operations
-    prune_opa: float = 0.9 / 255.0  
+    prune_opa: float = 1.0 / 255.0  
     grow_grad2d: float = 0.0006 # 0.00085
     max_splats: int  =  10_000_000
     max_steps: int = 30_000
@@ -148,7 +148,7 @@ class BrushStrategy(Strategy):
 
         
         if (step > self.refine_start_iter) and (step % self.refine_every == 0):
-            n_prune = self._prune_gs(params, optimizers, state)
+            n_prune = self._prune_gs(params, optimizers, state, v2)
 
             replace_ids = self._replace_pruned_gs(
                 params=params,
@@ -174,6 +174,7 @@ class BrushStrategy(Strategy):
                 optimizers=optimizers,
                 state=state,
                 chosen_inds=add_ids,
+                v2=v2
             )
             if self.verbose:
                 print(
@@ -184,13 +185,13 @@ class BrushStrategy(Strategy):
             # 衰减opac和scales
             # TODO: 当前衰减会导致无限接近透明，需要修改
             # if v2:
-            #     print("===触发衰减===")
             #     with torch.no_grad():
             #         train_t = step / self.max_steps
             #         t_shrink_strength = 1.0 - train_t
 
             #         minus_opac = self.opac_decay * t_shrink_strength
             #         scale_scaling = 1.0 - self.scales_decay * t_shrink_strength
+            #         print(f"当前opac学习率:{0.012},t_shrink_strength:{t_shrink_strength}, minus_opac:{minus_opac}, scale_scaling:{scale_scaling}")
 
             #         new_opac = torch.sigmoid(params["opacities"]) - minus_opac 
             #         new_opac = new_opac.clamp(1e-12, 1.0 - 1e-12) 
@@ -286,15 +287,18 @@ class BrushStrategy(Strategy):
         is_prune = alpha < self.prune_opa
 
         if v2:
-            max_allowed_bounds = max(self.bound.extent) * 100.
+            max_allowed_bounds = float(max(self.bound.extent) * 100.)
+            center_tensor = torch.from_numpy(self.bound.center).to(device=params["means"].device)
             # 删除过远的,过大的，过小的
-            is_far = torch.any((params["means"] - self.bound.center) > max_allowed_bounds, dim=1)
+            is_far = torch.any((params["means"] - center_tensor) > max_allowed_bounds, dim=1)
             is_big = torch.any(params["scales"] > max_allowed_bounds, dim=1)
-            is_small = torch.any(params["scales"] < 1e-10, dim=1)
+            is_small = torch.any(params["scales"].exp() < 1e-10, dim=1)
 
             is_prune = torch.logical_or(is_prune, is_far)
             is_prune = torch.logical_or(is_prune, is_big)
             is_prune = torch.logical_or(is_prune, is_small)
+
+            print(f"[删除细节] opac: {(alpha < self.prune_opa).sum().item()} far: {is_far.sum().item()} big: {(is_big.sum().item())} small: {(is_small.sum().item())}")
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:

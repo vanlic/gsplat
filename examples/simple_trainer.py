@@ -277,6 +277,11 @@ def create_splats_with_optimizers(
         means_lr = 4e-5
         scales_lr = 1e-2
         opacities_lr = 3e-2
+        if cfg.use_brush_v2:
+            means_lr = 2e-5
+            scales_lr = 7e-3
+            quats_lr = 2e-3
+            opacities_lr = 0.012
 
 
     params = [
@@ -374,11 +379,6 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        if cfg.use_brush_v2:
-            cfg.means_lr = 2e-5
-            cfg.scale_lr = 7e-3
-            cfg.quats_lr = 2e-3
-            cfg.opacities_lr = 0.012
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -751,8 +751,9 @@ class Runner:
 
             # regularizations
             if isinstance(cfg.strategy, BrushStrategy):
-                loss += 1e-8 * (1.0 - step / max_steps) * \
-                        (torch.sigmoid(self.splats["opacities"]) * (info["radii"] > 0.0).all(dim=-1).float()).sum()
+                if not self.cfg.use_brush_v2:
+                    loss += 1e-8 * (1.0 - step / max_steps) * \
+                            (torch.sigmoid(self.splats["opacities"]) * (info["radii"] > 0.0).all(dim=-1).float()).sum()
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
