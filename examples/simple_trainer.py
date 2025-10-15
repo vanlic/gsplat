@@ -600,7 +600,7 @@ class Runner:
             schedulers.append(
                 # scales has a learning rate schedule, that end at 0.01 of the initial value
                 torch.optim.lr_scheduler.ExponentialLR(
-                        self.optimizers["scales"], gamma=0.6 ** (1.0 / max_steps)
+                        self.optimizers["scales"], gamma=0.71428 ** (1.0 / max_steps)
                 ) 
             )
         if cfg.pose_opt:

@@ -189,6 +189,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             vec2 v_xy_local = {0.f, 0.f};
             vec2 v_xy_abs_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float v_refine = 0.f;
             // initialize everything to 0, only set if the lane is valid
             if (valid) {
                 // compute the current T for this gaussian
@@ -230,8 +231,17 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                         v_sigma * (conic.x * delta.x + conic.y * delta.y),
                         v_sigma * (conic.y * delta.x + conic.z * delta.y)
                     };
+                    // 对角线梯度
+                    float final_a = 1.f - T_final;
+                    final_a = fmaxf(final_a, 1e-5f); 
+                    float2 scaled = make_float2(v_xy_local.x * image_width,
+                                      v_xy_local.y * image_height);
+                    float len = sqrtf(scaled.x * scaled.x + scaled.y * scaled.y);
+                    v_refine += len / final_a;
+                    
                     if (v_means2d_abs != nullptr) {
-                        v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
+                        // v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
+                        v_xy_abs_local = {v_refine, abs(v_xy_local.y)};
                     }
                     v_opacity_local = vis * v_alpha;
                 }

@@ -112,7 +112,7 @@ class BrushStrategy(Strategy):
         if v2:
             # 更新默认参数
             self.refine_every = 200
-            # self.grow_grad2d = 0.003
+            self.grow_grad2d = 0.003
             self.refine_grow_fraction = 0.2
             # 更新noise权重、计算新box
             self.mean_noise_weight = 50
@@ -191,11 +191,16 @@ class BrushStrategy(Strategy):
 
             #         minus_opac = self.opac_decay * t_shrink_strength
             #         scale_scaling = 1.0 - self.scales_decay * t_shrink_strength
-            #         print(f"当前opac学习率:{0.012},t_shrink_strength:{t_shrink_strength}, minus_opac:{minus_opac}, scale_scaling:{scale_scaling}")
+                    
+            #         old_opac = torch.sigmoid(params["opacities"]).clone()
 
             #         new_opac = torch.sigmoid(params["opacities"]) - minus_opac 
             #         new_opac = new_opac.clamp(1e-12, 1.0 - 1e-12) 
             #         params["opacities"] = (new_opac / (1.0 - new_opac + 1e-24)).log()
+
+            #         diff = (new_opac - old_opac).abs() >= minus_opac
+
+            #         print(f"===当前变化点情况为：{torch.count_nonzero(diff)}/{old_opac.shape[0]}")
 
             #         new_scales = (params["scales"].exp() * scale_scaling).log()
             #         params["scales"] = new_scales
@@ -232,8 +237,9 @@ class BrushStrategy(Strategy):
             grads = info[self.key_for_gradient].absgrad.clone()
         else:
             grads = info[self.key_for_gradient].grad.clone()
-        grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-        grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+        # breakpoint()
+        # grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+        # grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 
         # initialize state on the first run
         n_gaussian = len(list(params.values())[0])
@@ -260,9 +266,13 @@ class BrushStrategy(Strategy):
             state["curr_splats"] = sel.float().flatten()
 
         # state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+        # state["grad2d"][gs_ids] = torch.maximum(
+        #     state["grad2d"][gs_ids],
+        #     grads.norm(dim=-1)
+        # )
         state["grad2d"][gs_ids] = torch.maximum(
             state["grad2d"][gs_ids],
-            grads.norm(dim=-1)
+            grads[..., 0]
         )
         state["count"].index_add_(
             0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
